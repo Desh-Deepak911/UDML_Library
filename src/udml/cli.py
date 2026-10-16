@@ -10,6 +10,13 @@ from udml.core.models import Document
 from udml.inspection import InspectionError, inspect_pdf, paths_refer_to_same_file
 from udml.parsers import PDFExtractionError, PyMuPDFParser
 from udml.serialization import save_document
+from udml.structure.tables import RuledGridConfig
+
+# Provisional PDF-point tolerances. They are not calibrated to any document.
+_PROVISIONAL_AXIS_TOLERANCE = 0.5
+_PROVISIONAL_SNAP_TOLERANCE = 0.5
+_PROVISIONAL_GAP_TOLERANCE = 1.0
+_PROVISIONAL_CONTAINMENT_TOLERANCE = 1.0
 
 
 class CLIError(Exception):
@@ -38,11 +45,59 @@ def main(argv: list[str] | None = None) -> None:
         required=True,
         help="Diagnostic PDF path",
     )
+    inspect_command.add_argument(
+        "--vectors",
+        action="store_true",
+        help="Also draw stored vector segments",
+    )
+    inspect_command.add_argument(
+        "--grids",
+        action="store_true",
+        help=(
+            "Draw supported ruled-grid cell boxes and highlight unassigned "
+            "spans. Results are geometric grid candidates, not confirmed "
+            "tables."
+        ),
+    )
+    _add_grid_tolerance(
+        inspect_command,
+        "--axis-tolerance",
+        _PROVISIONAL_AXIS_TOLERANCE,
+        "axis alignment",
+    )
+    _add_grid_tolerance(
+        inspect_command,
+        "--snap-tolerance",
+        _PROVISIONAL_SNAP_TOLERANCE,
+        "coordinate snapping",
+    )
+    _add_grid_tolerance(
+        inspect_command,
+        "--gap-tolerance",
+        _PROVISIONAL_GAP_TOLERANCE,
+        "collinear gap",
+    )
+    _add_grid_tolerance(
+        inspect_command,
+        "--containment-tolerance",
+        _PROVISIONAL_CONTAINMENT_TOLERANCE,
+        "span containment",
+    )
     args = parser.parse_args(argv)
     if args.command == "parse":
         _parse(args.pdf, args.output, overwrite=args.overwrite)
         return
-    _inspect(args.pdf, args.model, args.output)
+    _inspect(
+        args.pdf,
+        args.model,
+        args.output,
+        vectors=args.vectors,
+        grids=args.grids,
+        axis_tolerance=args.axis_tolerance,
+        snap_tolerance=args.snap_tolerance,
+        gap_tolerance=args.gap_tolerance,
+        containment_tolerance=args.containment_tolerance,
+    )
 
 
 def _parse(pdf: str, output: str, *, overwrite: bool) -> None:
@@ -66,20 +121,111 @@ def _reject_if_output_is_source(source: Path, destination: Path) -> None:
         raise CLIError("Output path refers to the source PDF.")
 
 
-def _inspect(pdf: str, model: str, output: str) -> None:
+def _add_grid_tolerance(
+    command: argparse.ArgumentParser,
+    name: str,
+    default: float,
+    kind: str,
+) -> None:
+    command.add_argument(
+        name,
+        type=float,
+        default=None,
+        metavar="PT",
+        help=(
+            f"Provisional {kind} tolerance in PDF points "
+            f"(default: {default}). Not calibrated. Used only with --grids."
+        ),
+    )
+
+
+def _inspect(
+    pdf: str,
+    model: str,
+    output: str,
+    *,
+    vectors: bool,
+    grids: bool,
+    axis_tolerance: float | None,
+    snap_tolerance: float | None,
+    gap_tolerance: float | None,
+    containment_tolerance: float | None,
+) -> None:
     try:
-        page_count, span_count = inspect_pdf(pdf, model, output)
-    except (OSError, PDFExtractionError, ValidationError, InspectionError) as exc:
+        configuration = _grid_configuration(
+            grids=grids,
+            axis_tolerance=axis_tolerance,
+            snap_tolerance=snap_tolerance,
+            gap_tolerance=gap_tolerance,
+            containment_tolerance=containment_tolerance,
+        )
+        counts = inspect_pdf(pdf, model, output, vectors=vectors, grids=configuration)
+    except (
+        OSError,
+        PDFExtractionError,
+        ValidationError,
+        InspectionError,
+        CLIError,
+    ) as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from exc
     print(f"Diagnostic copy: {output}")
-    print(f"Pages: {page_count}")
-    print(f"Spans: {span_count}")
-    print(
-        "Rectangles show stored span geometry. This is not a faithful "
-        "archival reproduction and does not prove that all source content "
-        "was extracted."
+    print(f"Pages: {counts.pages}")
+    print(f"Spans: {counts.spans}")
+    if vectors:
+        print(f"Vector segments: {counts.segments}")
+        print(
+            "Overlays show stored geometry. They do not prove that "
+            "extraction is complete or that visible table boundaries "
+            "were found."
+        )
+    else:
+        print(
+            "Rectangles show stored span geometry. This is not a faithful "
+            "archival reproduction and does not prove that all source content "
+            "was extracted."
+        )
+    if grids:
+        print(f"Grid candidates: {counts.candidates}")
+        print(f"Supported cells: {counts.cells}")
+        print(f"Assigned spans: {counts.assigned_spans}")
+        print(f"Unassigned spans: {counts.unassigned_spans}")
+        print(
+            "Tolerances are provisional and are not calibrated. "
+            "Cell boxes are geometric grid candidates, not confirmed tables."
+        )
+
+
+def _grid_configuration(
+    *,
+    grids: bool,
+    axis_tolerance: float | None,
+    snap_tolerance: float | None,
+    gap_tolerance: float | None,
+    containment_tolerance: float | None,
+) -> RuledGridConfig | None:
+    supplied = (
+        axis_tolerance,
+        snap_tolerance,
+        gap_tolerance,
+        containment_tolerance,
     )
+    if not grids:
+        if any(value is not None for value in supplied):
+            raise CLIError("Grid tolerances require --grids.")
+        return None
+    return RuledGridConfig(
+        axis_tolerance=_chosen(axis_tolerance, _PROVISIONAL_AXIS_TOLERANCE),
+        snap_tolerance=_chosen(snap_tolerance, _PROVISIONAL_SNAP_TOLERANCE),
+        gap_tolerance=_chosen(gap_tolerance, _PROVISIONAL_GAP_TOLERANCE),
+        containment_tolerance=_chosen(
+            containment_tolerance, _PROVISIONAL_CONTAINMENT_TOLERANCE
+        ),
+    )
+
+
+def _chosen(value: float | None, default: float) -> float:
+    return default if value is None else value
 
 
 def _print_summary(path: Path, document: Document) -> None:
