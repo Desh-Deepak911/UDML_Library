@@ -1,0 +1,38 @@
+[project]
+name = "udml"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Desh Deepak Singh", email = "desh.deepak911@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "networkx>=3.7",
+    "pdfplumber>=0.11.10",
+    "pydantic>=2.14.1",
+    "pymupdf>=1.28.2",
+]
+
+[project.scripts]
+udml = "udml.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.10,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
