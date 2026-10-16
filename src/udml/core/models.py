@@ -23,7 +23,7 @@ from pydantic import (
 
 from udml.core.geometry import BoundingBox, Point, union_boxes
 
-SCHEMA_VERSION: Literal["0.4.0"] = "0.4.0"
+SCHEMA_VERSION: Literal["0.5.0"] = "0.5.0"
 
 Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
 PositiveFiniteFloat = Annotated[FiniteFloat, Field(gt=0)]
@@ -35,7 +35,8 @@ class TextSpan(BaseModel):
     """One physical text run and its location in the parser output.
 
     ``text`` keeps the extracted characters, including spaces. ``font_flags``
-    is the parser's raw integer and is left undecoded. ``block_index``,
+    is the parser's raw integer and is left undecoded. ``origin`` is the
+    span origin reported by the parser, copied unchanged. ``block_index``,
     ``line_index``, and ``span_index`` are zero-based positions in that
     source structure.
     """
@@ -48,6 +49,7 @@ class TextSpan(BaseModel):
     font_name: str
     font_size: NonNegativeFiniteFloat
     font_flags: int
+    origin: Point
     block_index: SourceIndex
     line_index: SourceIndex
     span_index: SourceIndex
@@ -166,7 +168,7 @@ class Document(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["0.4.0"] = SCHEMA_VERSION
+    schema_version: Literal["0.5.0"] = SCHEMA_VERSION
     source_filename: str
     source_sha256: Sha256Hex
     parser_name: str

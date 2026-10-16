@@ -13,6 +13,7 @@ from udml.core.models import Document, Page
 from udml.parsers.base import InvalidPDFError, PasswordProtectedPDFError
 from udml.serialization import load_document
 from udml.structure.tables import (
+    BASELINE_FALLBACK,
     RuledGridCandidate,
     RuledGridConfig,
     ruled_grid_candidates,
@@ -30,6 +31,8 @@ _CELL_WIDTH = 1.0
 _UNASSIGNED_SPAN_COLOR = (0.75, 0.0, 0.7)
 _UNASSIGNED_SPAN_WIDTH = 1.0
 _UNASSIGNED_SPAN_DASHES = "[3 2] 0"
+_FALLBACK_SPAN_COLOR = (0.0, 0.55, 0.65)
+_FALLBACK_SPAN_WIDTH = 1.15
 
 
 class InspectionError(Exception):
@@ -46,6 +49,7 @@ class InspectionCounts(NamedTuple):
     cells: int
     assigned_spans: int
     unassigned_spans: int
+    fallback_spans: int
 
 
 def paths_refer_to_same_file(left: Path, right: Path) -> bool:
@@ -64,11 +68,13 @@ def inspect_pdf(
     *,
     vectors: bool = False,
     grids: RuledGridConfig | None = None,
+    baseline_fallback: bool = False,
 ) -> InspectionCounts:
     """Write a PDF copy with rectangles around the model's stored spans.
 
     When ``vectors`` is true, also stroke the model's stored vector segments.
     When ``grids`` is set, draw ruled-grid cell boxes from that configuration.
+    ``baseline_fallback`` also marks spans assigned by an interior baseline.
     The source PDF and UDML JSON are not modified. Text is not extracted again,
     and ``get_drawings()`` is not called.
     """
@@ -102,7 +108,9 @@ def inspect_pdf(
             raise InvalidPDFError(f"{source.name} is not a PDF.")
         _check_pages(pdf, document)
         if grids is not None:
-            candidates = ruled_grid_candidates(document, grids)
+            candidates = ruled_grid_candidates(
+                document, grids, baseline_fallback=baseline_fallback
+            )
         _draw_spans(pdf, document)
         if vectors:
             _draw_vectors(pdf, document)
@@ -115,8 +123,8 @@ def inspect_pdf(
 
     span_count = sum(len(page.spans) for page in document.pages)
     segment_count = sum(len(page.vector_segments) for page in document.pages)
-    candidate_count, cell_count, assigned_count, unassigned_count = _count_grids(
-        candidates
+    candidate_count, cell_count, assigned_count, unassigned_count, fallback_count = (
+        _count_grids(candidates)
     )
     return InspectionCounts(
         len(document.pages),
@@ -126,6 +134,7 @@ def inspect_pdf(
         cell_count,
         assigned_count,
         unassigned_count,
+        fallback_count,
     )
 
 
@@ -267,12 +276,31 @@ def _draw_grids(
                 width=_UNASSIGNED_SPAN_WIDTH,
                 dashes=_UNASSIGNED_SPAN_DASHES,
             )
+        fallback_drawn: set[str] = set()
+        for candidate in page_candidates:
+            for record in candidate.assignments:
+                if (
+                    record.method != BASELINE_FALLBACK
+                    or record.span_id in fallback_drawn
+                ):
+                    continue
+                fallback_drawn.add(record.span_id)
+                span = spans.get(record.span_id)
+                if span is None:
+                    raise InspectionError(
+                        f"Page {model_page.number} grid candidate references "
+                        f"unknown span {record.span_id}."
+                    )
+                box = span.bbox
+                shape.draw_rect(pymupdf.Rect(box.x0, box.y0, box.x1, box.y1))
+        if fallback_drawn:
+            shape.finish(color=_FALLBACK_SPAN_COLOR, width=_FALLBACK_SPAN_WIDTH)
         shape.commit(overlay=True)
 
 
 def _count_grids(
     candidates: list[RuledGridCandidate],
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Count candidates, cells, and spans once per page."""
     by_page: dict[int, list[RuledGridCandidate]] = {}
     for candidate in candidates:
@@ -280,17 +308,25 @@ def _count_grids(
     cells = 0
     assigned = 0
     unassigned = 0
+    fallback = 0
     for page_candidates in by_page.values():
         assigned_ids: set[str] = set()
         unassigned_ids: set[str] = set()
+        fallback_ids: set[str] = set()
         for candidate in page_candidates:
             cells += len(candidate.cells)
             for cell in candidate.cells:
                 assigned_ids.update(cell.span_ids)
             unassigned_ids.update(candidate.unassigned_span_ids)
+            fallback_ids.update(
+                record.span_id
+                for record in candidate.assignments
+                if record.method == BASELINE_FALLBACK
+            )
         assigned += len(assigned_ids)
         unassigned += len(unassigned_ids)
-    return len(candidates), cells, assigned, unassigned
+        fallback += len(fallback_ids)
+    return len(candidates), cells, assigned, unassigned, fallback
 
 
 def _publish_pdf(

@@ -59,6 +59,15 @@ def main(argv: list[str] | None = None) -> None:
             "tables."
         ),
     )
+    inspect_command.add_argument(
+        "--baseline-fallback",
+        action="store_true",
+        help=(
+            "With --grids, assign a horizontal span when its baseline y is "
+            "inside exactly one cell and its box fits that cell horizontally. "
+            "This does not show that glyph ink lies inside the cell."
+        ),
+    )
     _add_grid_tolerance(
         inspect_command,
         "--axis-tolerance",
@@ -97,6 +106,7 @@ def main(argv: list[str] | None = None) -> None:
         snap_tolerance=args.snap_tolerance,
         gap_tolerance=args.gap_tolerance,
         containment_tolerance=args.containment_tolerance,
+        baseline_fallback=args.baseline_fallback,
     )
 
 
@@ -150,6 +160,7 @@ def _inspect(
     snap_tolerance: float | None,
     gap_tolerance: float | None,
     containment_tolerance: float | None,
+    baseline_fallback: bool,
 ) -> None:
     try:
         configuration = _grid_configuration(
@@ -158,8 +169,16 @@ def _inspect(
             snap_tolerance=snap_tolerance,
             gap_tolerance=gap_tolerance,
             containment_tolerance=containment_tolerance,
+            baseline_fallback=baseline_fallback,
         )
-        counts = inspect_pdf(pdf, model, output, vectors=vectors, grids=configuration)
+        counts = inspect_pdf(
+            pdf,
+            model,
+            output,
+            vectors=vectors,
+            grids=configuration,
+            baseline_fallback=baseline_fallback,
+        )
     except (
         OSError,
         PDFExtractionError,
@@ -188,12 +207,21 @@ def _inspect(
     if grids:
         print(f"Grid candidates: {counts.candidates}")
         print(f"Supported cells: {counts.cells}")
-        print(f"Assigned spans: {counts.assigned_spans}")
+        if baseline_fallback:
+            print(f"Strict assignments: {counts.assigned_spans}")
+            print(f"Baseline fallback assignments: {counts.fallback_spans}")
+        else:
+            print(f"Assigned spans: {counts.assigned_spans}")
         print(f"Unassigned spans: {counts.unassigned_spans}")
         print(
             "Tolerances are provisional and are not calibrated. "
             "Cell boxes are geometric grid candidates, not confirmed tables."
         )
+        if baseline_fallback:
+            print(
+                "Baseline fallback assignments are not evidence that "
+                "glyph ink lies inside the cell."
+            )
 
 
 def _grid_configuration(
@@ -203,6 +231,7 @@ def _grid_configuration(
     snap_tolerance: float | None,
     gap_tolerance: float | None,
     containment_tolerance: float | None,
+    baseline_fallback: bool,
 ) -> RuledGridConfig | None:
     supplied = (
         axis_tolerance,
@@ -213,6 +242,8 @@ def _grid_configuration(
     if not grids:
         if any(value is not None for value in supplied):
             raise CLIError("Grid tolerances require --grids.")
+        if baseline_fallback:
+            raise CLIError("Baseline fallback requires --grids.")
         return None
     return RuledGridConfig(
         axis_tolerance=_chosen(axis_tolerance, _PROVISIONAL_AXIS_TOLERANCE),

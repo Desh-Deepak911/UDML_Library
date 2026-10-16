@@ -20,6 +20,7 @@ def _span(**overrides) -> TextSpan:
         "font_name": "Helvetica",
         "font_size": 12,
         "font_flags": 0,
+        "origin": {"x": 0.0, "y": 10.0},
         "block_index": 0,
         "line_index": 0,
         "span_index": 0,
@@ -69,7 +70,7 @@ def test_valid_minimal_document():
     span = page.spans[0]
     box = span.bbox
 
-    assert document.schema_version == "0.4.0"
+    assert document.schema_version == "0.5.0"
     assert document.source_filename == "sample.pdf"
     assert document.source_sha256 == SHA256
     assert document.parser_name == "pymupdf"

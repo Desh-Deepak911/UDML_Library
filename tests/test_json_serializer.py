@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from udml.core import BoundingBox, Document, Page, TextSpan
+from udml.core import BoundingBox, Document, Page, Point, TextSpan
 from udml.core.models import build_source_groups
 from udml.serialization import load_document, save_document
 
@@ -13,6 +13,7 @@ def test_json_round_trip_preserves_document(tmp_path):
         font_name="Helvetica",
         font_size=11,
         font_flags=16,
+        origin=Point(x=-4, y=8),
         block_index=1,
         line_index=2,
         span_index=3,

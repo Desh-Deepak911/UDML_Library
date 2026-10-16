@@ -20,12 +20,19 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
-from udml.core.geometry import BoundingBox, union_boxes
-from udml.core.models import Document, Page
+from udml.core.geometry import BoundingBox, Point, union_boxes
+from udml.core.models import Document, Page, TextLine, TextSpan
 
 _Line = tuple[float, list[tuple[float, float]]]
+_Interval = tuple[float, tuple[float, float]]
 
 RULED_GRID_V1: Literal["ruled-grid-v1"] = "ruled-grid-v1"
+BBOX_CONTAINMENT: Literal["bbox-containment"] = "bbox-containment"
+BASELINE_FALLBACK: Literal["baseline-fallback"] = "baseline-fallback"
+# Direction components must be this close to (1, 0). Not a containment tolerance.
+_HORIZONTAL_DIRECTION_TOLERANCE = 1e-3
+# Baseline y within this distance of a cell edge is ambiguous. PDF points.
+_BASELINE_BOUNDARY_EPSILON = 0.05
 
 RULED_GRID_LIMITATIONS = (
     "These are ruled-grid candidates, not confirmed tables.",
@@ -57,11 +64,28 @@ class RuledGridConfig(BaseModel):
     containment_tolerance: Annotated[FiniteFloat, Field(ge=0)]
 
 
+class SpanCellAssignment(BaseModel):
+    """One derived span-to-cell assignment.
+
+    This is not part of the document schema. ``bbox`` and ``origin`` are the
+    source span values. They do not show that glyph ink lies inside ``cell``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    span_id: str
+    cell: BoundingBox
+    method: Literal["bbox-containment", "baseline-fallback"]
+    bbox: BoundingBox
+    origin: Point
+
+
 class RuledGridCell(BaseModel):
     """One elementary rectangle with all four ruled sides.
 
-    ``span_ids`` are spans wholly inside this cell and no other cell of the
-    same candidate. The order is lexicographic, not a reading order.
+    ``span_ids`` are spans wholly inside this cell and no other cell on the
+    page. The order is lexicographic, not a reading order. Baseline fallback
+    assignments are not included.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -77,7 +101,8 @@ class RuledGridCandidate(BaseModel):
     no elementary cell was supported. ``cells`` follow increasing ``y0``,
     then increasing ``x0``, in unrotated page space. That is not a reading
     order. ``unassigned_span_ids`` are spans that meet the candidate region
-    but do not lie wholly inside exactly one of its cells.
+    and are not assigned. ``assignments`` records the method used. A
+    baseline fallback does not show that glyph ink lies inside the cell.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -87,12 +112,16 @@ class RuledGridCandidate(BaseModel):
     bbox: BoundingBox
     cells: list[RuledGridCell] = Field(min_length=1)
     unassigned_span_ids: list[str]
+    assignments: list[SpanCellAssignment]
     method: Literal["ruled-grid-v1"] = RULED_GRID_V1
     configuration: RuledGridConfig
 
 
 def ruled_grid_candidates(
-    document: Document, configuration: RuledGridConfig
+    document: Document,
+    configuration: RuledGridConfig,
+    *,
+    baseline_fallback: bool = False,
 ) -> list[RuledGridCandidate]:
     """Return ruled-grid candidates for each page.
 
@@ -107,18 +136,23 @@ def ruled_grid_candidates(
     the median. Overlapping collinear intervals, and gaps no larger than
     ``gap_tolerance``, become one interval.
 
-    An intersection joins a horizontal line and a vertical line when each
-    covers the other's snapped coordinate within ``snap_tolerance``. A
-    connected component is kept only when it has at least two horizontal and
-    two vertical coordinates and at least one elementary cell. A cell exists
-    only when each of its four sides is covered by a merged interval within
-    ``snap_tolerance``. Adjacent coordinates are the only cell sizes; a
-    larger rectangle is not substituted for missing internal rulings.
+    Each merged interval is its own connectivity vertex. An intersection
+    joins one horizontal interval to one vertical interval when those
+    intervals cross within ``snap_tolerance``. Sharing a snapped coordinate
+    does not join intervals that do not meet. A connected component is kept
+    only when it has at least two horizontal and two vertical coordinates
+    and at least one elementary cell. Cell coordinates come from that
+    component's own intervals. A cell exists only when each of its four
+    sides is covered by one of those intervals within ``snap_tolerance``.
+    Adjacent coordinates are the only cell sizes; a larger rectangle is not
+    substituted for missing internal rulings.
     """
     candidates: list[RuledGridCandidate] = []
     recorded = configuration.model_copy()
     for page in document.pages:
-        candidates.extend(_page_candidates(page, recorded))
+        candidates.extend(
+            _page_candidates(page, recorded, baseline_fallback=baseline_fallback)
+        )
     return candidates
 
 
@@ -145,9 +179,14 @@ class _UnionFind:
 
 
 def _page_candidates(
-    page: Page, configuration: RuledGridConfig
+    page: Page,
+    configuration: RuledGridConfig,
+    *,
+    baseline_fallback: bool,
 ) -> list[RuledGridCandidate]:
-    horizontals, verticals = _ruling_segments(page, configuration)
+    horizontal_lines, vertical_lines = _ruling_segments(page, configuration)
+    horizontals = _interval_vertices(horizontal_lines)
+    verticals = _interval_vertices(vertical_lines)
     if not horizontals or not verticals:
         return []
     slack = configuration.snap_tolerance
@@ -159,7 +198,13 @@ def _page_candidates(
             cell_groups.append(sorted(boxes, key=_box_key))
     cell_groups.sort(key=_geometry_key)
     regions = [union_boxes(boxes) for boxes in cell_groups]
-    assigned, unassigned = _assign_spans(page, cell_groups, regions, configuration)
+    assigned, unassigned, assignments = _assign_spans(
+        page,
+        cell_groups,
+        regions,
+        configuration,
+        baseline_fallback=baseline_fallback,
+    )
     candidates: list[RuledGridCandidate] = []
     for index, boxes in enumerate(cell_groups):
         cells = [
@@ -173,6 +218,7 @@ def _page_candidates(
                 bbox=regions[index],
                 cells=cells,
                 unassigned_span_ids=unassigned[index],
+                assignments=assignments[index],
                 method=RULED_GRID_V1,
                 configuration=configuration.model_copy(),
             )
@@ -212,7 +258,9 @@ def _snap_and_merge(
 ) -> list[_Line]:
     if not records:
         return []
-    clusters = _clusters([record[0] for record in records], configuration.snap_tolerance)
+    clusters = _clusters(
+        [record[0] for record in records], configuration.snap_tolerance
+    )
     grouped: dict[float, list[tuple[float, float]]] = {}
     for position, start, end in records:
         snapped = _snap(position, clusters, configuration.snap_tolerance)
@@ -274,17 +322,25 @@ def _merge(
     return [(start, end) for start, end in merged]
 
 
+def _interval_vertices(lines: list[_Line]) -> list[_Interval]:
+    """One vertex for each merged interval, not for each snapped coordinate."""
+    return [
+        (position, (start, end)) for position, pieces in lines for start, end in pieces
+    ]
+
+
 def _components(
-    horizontals: list[_Line],
-    verticals: list[_Line],
+    horizontals: list[_Interval],
+    verticals: list[_Interval],
     slack: float,
 ) -> list[tuple[list[int], list[int]]]:
     horizontal_count = len(horizontals)
     union_find = _UnionFind(horizontal_count + len(verticals))
-    for horizontal_index, (y_position, h_intervals) in enumerate(horizontals):
-        for vertical_index, (x_position, v_intervals) in enumerate(verticals):
-            crosses = _point_on(h_intervals, x_position, slack) and _point_on(
-                v_intervals, y_position, slack
+    for horizontal_index, (y_position, (x_start, x_end)) in enumerate(horizontals):
+        for vertical_index, (x_position, (y_start, y_end)) in enumerate(verticals):
+            crosses = (
+                x_start - slack <= x_position <= x_end + slack
+                and y_start - slack <= y_position <= y_end + slack
             )
             if crosses:
                 union_find.union(horizontal_index, horizontal_count + vertical_index)
@@ -295,30 +351,32 @@ def _components(
     for indexes in grouped.values():
         horizontal_ids = [index for index in indexes if index < horizontal_count]
         vertical_ids = [
-            index - horizontal_count
-            for index in indexes
-            if index >= horizontal_count
+            index - horizontal_count for index in indexes if index >= horizontal_count
         ]
-        if len(horizontal_ids) >= 2 and len(vertical_ids) >= 2:
+        horizontal_positions = {horizontals[index][0] for index in horizontal_ids}
+        vertical_positions = {verticals[index][0] for index in vertical_ids}
+        if len(horizontal_positions) >= 2 and len(vertical_positions) >= 2:
             components.append((horizontal_ids, vertical_ids))
     return components
 
 
 def _cells(
-    horizontals: list[_Line],
-    verticals: list[_Line],
+    horizontals: list[_Interval],
+    verticals: list[_Interval],
     horizontal_ids: list[int],
     vertical_ids: list[int],
     slack: float,
 ) -> list[BoundingBox]:
-    ys = sorted(horizontals[index][0] for index in horizontal_ids)
-    xs = sorted(verticals[index][0] for index in vertical_ids)
-    horizontal_intervals = {
-        horizontals[index][0]: horizontals[index][1] for index in horizontal_ids
-    }
-    vertical_intervals = {
-        verticals[index][0]: verticals[index][1] for index in vertical_ids
-    }
+    horizontal_intervals: dict[float, list[tuple[float, float]]] = {}
+    for index in horizontal_ids:
+        position, interval = horizontals[index]
+        horizontal_intervals.setdefault(position, []).append(interval)
+    vertical_intervals: dict[float, list[tuple[float, float]]] = {}
+    for index in vertical_ids:
+        position, interval = verticals[index]
+        vertical_intervals.setdefault(position, []).append(interval)
+    ys = sorted(horizontal_intervals)
+    xs = sorted(vertical_intervals)
     boxes: list[BoundingBox] = []
     for x_index in range(len(xs) - 1):
         x0, x1 = xs[x_index], xs[x_index + 1]
@@ -335,16 +393,12 @@ def _cells(
     return boxes
 
 
-def _point_on(
-    intervals: list[tuple[float, float]], point: float, slack: float
-) -> bool:
-    return any(start - slack <= point <= end + slack for start, end in intervals)
-
-
 def _covers(
     intervals: list[tuple[float, float]], start: float, end: float, slack: float
 ) -> bool:
-    return any(left <= start + slack and right >= end - slack for left, right in intervals)
+    return any(
+        left <= start + slack and right >= end - slack for left, right in intervals
+    )
 
 
 def _assign_spans(
@@ -352,11 +406,25 @@ def _assign_spans(
     cell_groups: list[list[BoundingBox]],
     regions: list[BoundingBox],
     configuration: RuledGridConfig,
-) -> tuple[list[list[list[str]]], list[list[str]]]:
-    """Assign a span only when it fits inside exactly one cell on the page."""
+    *,
+    baseline_fallback: bool,
+) -> tuple[
+    list[list[list[str]]],
+    list[list[str]],
+    list[list[SpanCellAssignment]],
+]:
+    """Assign spans that fit exactly one cell.
+
+    Full-box containment is the only method unless ``baseline_fallback`` is
+    set. The fallback applies only when no cell contains the box. A baseline
+    on or near a cell edge is left unassigned. Records do not change the
+    source span box.
+    """
     tolerance = configuration.containment_tolerance
+    lines = {span_id: line for line in page.lines for span_id in line.span_ids}
     assigned = [[[] for _ in boxes] for boxes in cell_groups]
     unassigned: list[list[str]] = [[] for _ in cell_groups]
+    assignments: list[list[SpanCellAssignment]] = [[] for _ in cell_groups]
     for span in page.spans:
         fits: list[tuple[int, int]] = []
         for candidate_index, boxes in enumerate(cell_groups):
@@ -366,6 +434,28 @@ def _assign_spans(
         if len(fits) == 1:
             candidate_index, cell_index = fits[0]
             assigned[candidate_index][cell_index].append(span.id)
+            assignments[candidate_index].append(
+                _assignment(
+                    span,
+                    cell_groups[candidate_index][cell_index],
+                    BBOX_CONTAINMENT,
+                )
+            )
+            continue
+        fallback = None
+        if baseline_fallback and len(fits) == 0:
+            fallback = _baseline_cell(
+                span, lines.get(span.id), cell_groups, tolerance
+            )
+        if fallback is not None:
+            candidate_index, cell_index = fallback
+            assignments[candidate_index].append(
+                _assignment(
+                    span,
+                    cell_groups[candidate_index][cell_index],
+                    BASELINE_FALLBACK,
+                )
+            )
             continue
         for candidate_index, region in enumerate(regions):
             in_candidate = any(index == candidate_index for index, _ in fits)
@@ -376,7 +466,73 @@ def _assign_spans(
             cell_ids.sort()
     for span_ids in unassigned:
         span_ids.sort()
-    return assigned, unassigned
+    for records in assignments:
+        records.sort(key=lambda record: record.span_id)
+    return assigned, unassigned, assignments
+
+
+def _assignment(
+    span: TextSpan,
+    cell: BoundingBox,
+    method: Literal["bbox-containment", "baseline-fallback"],
+) -> SpanCellAssignment:
+    return SpanCellAssignment(
+        span_id=span.id,
+        cell=cell,
+        method=method,
+        bbox=span.bbox,
+        origin=span.origin,
+    )
+
+
+def _baseline_cell(
+    span: TextSpan,
+    line: TextLine | None,
+    cell_groups: list[list[BoundingBox]],
+    tolerance: float,
+) -> tuple[int, int] | None:
+    """Return the one cell whose interior contains this horizontal baseline."""
+    if line is None or not _supports_baseline_fallback(line):
+        return None
+    interior: list[tuple[int, int]] = []
+    near_boundary = False
+    for candidate_index, boxes in enumerate(cell_groups):
+        for cell_index, box in enumerate(boxes):
+            if not _contains_horizontally(box, span.bbox, tolerance):
+                continue
+            band = _baseline_band(span.origin.y, box)
+            if band == "interior":
+                interior.append((candidate_index, cell_index))
+            elif band == "near":
+                near_boundary = True
+    if near_boundary or len(interior) != 1:
+        return None
+    return interior[0]
+
+
+def _supports_baseline_fallback(line: TextLine) -> bool:
+    if line.writing_mode != 0:
+        return False
+    dx, dy = line.direction
+    return (
+        abs(dx - 1) <= _HORIZONTAL_DIRECTION_TOLERANCE
+        and abs(dy) <= _HORIZONTAL_DIRECTION_TOLERANCE
+    )
+
+
+def _contains_horizontally(
+    cell: BoundingBox, span: BoundingBox, tolerance: float
+) -> bool:
+    return span.x0 >= cell.x0 - tolerance and span.x1 <= cell.x1 + tolerance
+
+
+def _baseline_band(baseline_y: float, cell: BoundingBox) -> str:
+    epsilon = _BASELINE_BOUNDARY_EPSILON
+    if cell.y0 + epsilon < baseline_y < cell.y1 - epsilon:
+        return "interior"
+    if cell.y0 - epsilon <= baseline_y <= cell.y1 + epsilon:
+        return "near"
+    return "outside"
 
 
 def _contains(cell: BoundingBox, span: BoundingBox, tolerance: float) -> bool:

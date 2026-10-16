@@ -193,7 +193,17 @@ def _convert_spans(
                     line, page_number, block_index, line_index
                 )
             for span_index, span in enumerate(line_spans):
+                where = (
+                    f"page {page_number}, block {block_index}, "
+                    f"line {line_index}, span {span_index}"
+                )
                 x0, y0, x1, y1 = span["bbox"]
+                try:
+                    raw_origin = span["origin"]
+                except KeyError as exc:
+                    raise PDFExtractionError(
+                        f"PyMuPDF span is missing 'origin' ({where})."
+                    ) from exc
                 spans.append(
                     TextSpan(
                         id=f"p{page_number}-b{block_index}-l{line_index}-s{span_index}",
@@ -202,6 +212,7 @@ def _convert_spans(
                         font_name=span["font"],
                         font_size=span["size"],
                         font_flags=span["flags"],
+                        origin=_point(raw_origin, where),
                         block_index=block_index,
                         line_index=line_index,
                         span_index=span_index,

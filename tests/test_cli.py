@@ -22,7 +22,7 @@ def test_cli_parse_writes_udml_json(tmp_path, capsys):
     text = "".join(span.text for page in document.pages for span in page.spans)
     span_count = sum(len(page.spans) for page in document.pages)
     assert document.source_filename == "example.pdf"
-    assert document.schema_version == "0.4.0"
+    assert document.schema_version == "0.5.0"
     assert len(document.pages) == 1
     assert "Hello UDML" in text
     assert f"Output: {output}" in captured.out
